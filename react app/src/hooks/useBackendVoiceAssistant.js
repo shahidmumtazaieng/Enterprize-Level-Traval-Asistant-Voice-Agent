@@ -1,0 +1,241 @@
+import { useState, useEffect, useRef } from 'react'
+
+export const useBackendVoiceAssistant = () => {
+  const [isConnected, setIsConnected] = useState(false)
+  const [isListening, setIsListening] = useState(false)
+  const [isSpeaking, setIsSpeaking] = useState(false)
+  const [messages, setMessages] = useState([])
+  const [connectionStatus, setConnectionStatus] = useState('disconnected')
+  const [error, setError] = useState(null)
+  const [sessionId, setSessionId] = useState(null)
+  const [sessionData, setSessionData] = useState(null)
+  
+  const wsRef = useRef(null)
+
+  // Create session with backend
+  const createSession = async () => {
+    try {
+      const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+      console.log('Creating session with backend:', `${API_URL}/sessions`)
+      
+      const sessionResponse = await fetch(`${API_URL}/sessions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          system_prompt: "You are a friendly travel assistant.",
+          agent_name: "TravelAssistant"
+        })
+      })
+      
+      console.log('Session response status:', sessionResponse.status)
+      
+      if (!sessionResponse.ok) {
+        const errorText = await sessionResponse.text()
+        console.error('Session creation failed:', errorText)
+        throw new Error(`Failed to create session: ${sessionResponse.status} ${sessionResponse.statusText} - ${errorText}`)
+      }
+      
+      const sessionData = await sessionResponse.json()
+      console.log('Session created successfully:', sessionData)
+      setSessionId(sessionData.session_id)
+      setSessionData(sessionData)
+      return sessionData
+    } catch (err) {
+      console.error('Error creating session:', err)
+      throw err
+    }
+  }
+
+  // Connect to backend WebSocket
+  const connectToVoiceService = async () => {
+    try {
+      setConnectionStatus('connecting')
+      setError(null)
+      
+      // Get API URL from environment variable
+      const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+      
+      // Create session if not already created
+      let sessionDataToUse = sessionData
+      if (!sessionDataToUse) {
+        console.log('No existing session, creating new one...')
+        sessionDataToUse = await createSession()
+      } else {
+        console.log('Using existing session:', sessionDataToUse.session_id)
+      }
+      
+      // Connect to backend WebSocket endpoint
+      const wsUrl = `${API_URL.replace('http', 'ws')}/ws/${sessionDataToUse.session_id}`
+      console.log('Connecting to backend WebSocket:', wsUrl)
+      
+      wsRef.current = new WebSocket(wsUrl)
+      
+      wsRef.current.onopen = () => {
+        console.log('Connected to backend WebSocket')
+        setIsConnected(true)
+        setConnectionStatus('connected')
+        setError(null)
+        
+        // Add initial welcome message
+        setMessages(prev => [
+          ...prev,
+          {
+            type: 'assistant',
+            content: 'Hello! I\'m your Enterprise Travel Assistant. How can I help you plan your next trip?'
+          }
+        ])
+      }
+      
+      wsRef.current.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data)
+          console.log('Received message from backend:', data)
+          handleMessageFromBackend(data)
+        } catch (err) {
+          console.error('Error parsing WebSocket message:', err)
+          setError('Error processing response from voice service')
+        }
+      }
+      
+      wsRef.current.onerror = (error) => {
+        console.error('WebSocket error:', error)
+        const errorMessage = error.message || error.toString()
+        setError('Connection error: ' + errorMessage)
+        setConnectionStatus('error')
+      }
+      
+      wsRef.current.onclose = (event) => {
+        console.log('Disconnected from backend WebSocket', event.reason, 'Code:', event.code)
+        setIsConnected(false)
+        if (event.code !== 1000) { // Not a normal closure
+          setError(`Connection closed: ${event.reason || 'Unknown reason'} (Code: ${event.code})`)
+          setConnectionStatus('error')
+        } else {
+          setConnectionStatus('disconnected')
+        }
+      }
+    } catch (err) {
+      console.error('Error connecting to voice service:', err)
+      setError(err.message || 'Failed to connect to voice service')
+      setConnectionStatus('error')
+    }
+  }
+
+  // Handle messages from backend
+  const handleMessageFromBackend = (data) => {
+    console.log('Handling message from backend:', data);
+    switch (data.type) {
+      case 'user_transcript':
+        const userMessage = { type: 'user', content: data.transcript }
+        setMessages(prev => [...prev, userMessage])
+        break
+      case 'ai_response':
+        const aiMessage = { type: 'assistant', content: data.text }
+        setMessages(prev => [...prev, aiMessage])
+        setIsSpeaking(true)
+        // Reset speaking state after a delay
+        setTimeout(() => setIsSpeaking(false), 2000)
+        break
+      case 'listening_started':
+        setIsListening(true)
+        setIsSpeaking(false)
+        break
+      case 'listening_stopped':
+        setIsListening(false)
+        break
+      case 'processing_started':
+        setIsListening(false)
+        setIsSpeaking(true)
+        break
+      case 'processing_stopped':
+        setIsSpeaking(false)
+        break
+      case 'session_ready':
+        console.log('Session is ready for voice interaction')
+        break
+      case 'session_stopped':
+        console.log('Session has been stopped')
+        break
+      case 'connection_established':
+        console.log('Connection established with voice service')
+        break
+      case 'error':
+        setError(data.message || 'Unknown error from backend')
+        break
+      default:
+        console.log('Unknown message type:', data.type, data)
+    }
+  }
+
+  // Start listening for user speech
+  const startListening = async () => {
+    if (!isConnected) {
+      await connectToVoiceService()
+      // Wait a bit for connection to establish
+      await new Promise(resolve => setTimeout(resolve, 1000))
+    }
+    
+    try {
+      // Send start listening message to backend
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ 
+          type: 'control',
+          action: 'start'
+        }))
+      }
+    } catch (err) {
+      console.error('Error starting listening:', err)
+      setError('Failed to start listening')
+    }
+  }
+
+  // Stop listening for user speech
+  const stopListening = () => {
+    try {
+      // Send stop listening message to backend
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ 
+          type: 'control',
+          action: 'stop'
+        }))
+      }
+    } catch (err) {
+      console.error('Error stopping listening:', err)
+    }
+  }
+
+  // Toggle listening state
+  const toggleListening = () => {
+    if (isListening) {
+      stopListening()
+    } else {
+      startListening()
+    }
+  }
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close()
+      }
+    }
+  }, [])
+
+  return {
+    isConnected,
+    isListening,
+    isSpeaking,
+    messages,
+    connectionStatus,
+    error,
+    sessionId,
+    sessionData,
+    connectToVoiceService,
+    startListening,
+    stopListening,
+    toggleListening
+  }
+}

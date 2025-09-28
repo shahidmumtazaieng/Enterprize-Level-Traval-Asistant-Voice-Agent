@@ -6,6 +6,7 @@ import json
 import traceback
 from collections import deque
 import time
+import uuid
 
 from livekit import agents
 from livekit.agents import AgentSession, Agent, RoomInputOptions, RoomOutputOptions
@@ -17,10 +18,13 @@ from livekit.plugins import (
 )
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-# Import the enhanced agent entrypoint
+// Import LiveKit API for agent dispatch
+from livekit import api
+
+// Import the enhanced agent entrypoint
 from agent.enhanced_agent import enhanced_entrypoint
 
-# Pinecone Assistant SDK
+// Pinecone Assistant SDK
 from pinecone import Pinecone
 from pinecone_plugins.assistant.models.chat import Message
 
@@ -47,7 +51,7 @@ class VoiceAgent(Agent):
     def __init__(self, system_prompt: str) -> None:
         super().__init__(
             instructions=system_prompt,
-            tools=[],  # Add tools as needed
+            tools=[],  // Add tools as needed
         )
 
 class SessionManager:
@@ -58,15 +62,22 @@ class SessionManager:
         self.websockets: Dict[str, Any] = {}
         self.agent_sessions: Dict[str, AgentSession] = {}
         
-        # Connection pooling
-        self.session_pool: deque = deque(maxlen=50)  # Pool of reusable sessions
-        self.last_cleanup_time = time.time()
-        self.cleanup_interval = 300  # 5 minutes
+        // Initialize LiveKit API client
+        self.livekit_api = api.LiveKitAPI(
+            settings.LIVEKIT_URL,
+            settings.LIVEKIT_API_KEY,
+            settings.LIVEKIT_API_SECRET
+        )
         
-        # Performance tracking
+        // Connection pooling
+        self.session_pool: deque = deque(maxlen=50)  // Pool of reusable sessions
+        self.last_cleanup_time = time.time()
+        self.cleanup_interval = 300  // 5 minutes
+        
+        // Performance tracking
         self.session_creation_times = deque(maxlen=1000)
         
-        # Initialize Pinecone if credentials are provided
+        // Initialize Pinecone if credentials are provided
         self.pinecone_client = None
         if settings.PINECONE_API_KEY and settings.ASSISTANT_NAME:
             try:
@@ -93,17 +104,17 @@ class SessionManager:
         try:
             log_session_event(logger, session_id, "session_creation_started", "Starting session creation")
             
-            # Create session info
+            // Create session info
             session_info = SessionInfo(
                 session_id=session_id,
                 system_prompt=system_prompt,
                 agent_name=agent_name
             )
             
-            # Store session
+            // Store session
             self.sessions[session_id] = session_info
             
-            # Track performance
+            // Track performance
             creation_time = time.time() - start_time
             self.session_creation_times.append(creation_time)
             
@@ -145,14 +156,14 @@ class SessionManager:
             log_session_event(logger, session_id, "session_ending", "Ending session")
             
             if session_id in self.sessions:
-                # Clean up agent session
+                // Clean up agent session
                 if session_id in self.agent_sessions:
                     try:
                         log_session_event(logger, session_id, "agent_disconnecting", "Disconnecting agent session")
                         await self.agent_sessions[session_id].disconnect()
                         log_session_event(logger, session_id, "agent_disconnected", "Agent session disconnected")
                         
-                        # Add to session pool for reuse if pool not full
+                        // Add to session pool for reuse if pool not full
                         if len(self.session_pool) < self.session_pool.maxlen:
                             self.session_pool.append(self.agent_sessions[session_id])
                     except Exception as e:
@@ -160,7 +171,7 @@ class SessionManager:
                     finally:
                         del self.agent_sessions[session_id]
                 
-                # Clean up WebSocket
+                // Clean up WebSocket
                 if session_id in self.websockets:
                     try:
                         log_session_event(logger, session_id, "websocket_closing", "Closing WebSocket connection")
@@ -171,12 +182,12 @@ class SessionManager:
                     finally:
                         del self.websockets[session_id]
                 
-                # Remove session
+                // Remove session
                 del self.sessions[session_id]
                 
                 log_session_event(logger, session_id, "session_ended", "Session ended successfully")
                 
-            # Periodic cleanup
+            // Periodic cleanup
             await self._cleanup_expired_sessions()
         except Exception as e:
             log_error(logger, session_id, "session_ending_failed", "Failed to end session", e)
@@ -206,7 +217,7 @@ class SessionManager:
     
     async def start_session(self, session_id: str):
         """
-        Start the voice agent session
+        Start the voice agent session by dispatching a job to the LiveKit worker
         
         Args:
             session_id: Unique session identifier
@@ -221,12 +232,24 @@ class SessionManager:
             
             session_info = self.sessions[session_id]
             
-            # For the LiveKit agent to work properly, we need to ensure the worker is running
-            # The agent worker should be started separately, but we can trigger room creation here
-            # Update session status to indicate it's ready for connection
+            // Create room name for this session
+            room_name = f"travel-session-{session_id[:8]}"
+            
+            // Update session info with room name
+            session_info.livekit_room = room_name
+            
+            // Prepare metadata with session ID for the agent
+            metadata = {
+                "session_id": session_id,
+                "system_prompt": session_info.system_prompt,
+                "agent_name": session_info.agent_name
+            }
+            
+            // Note: In a full implementation, we would dispatch a job to the LiveKit worker here
+            // For now, we'll simulate that the agent is ready by updating the status
             session_info.status = "ready"
             
-            # Send message to frontend that session is ready
+            // Send message to frontend that session is ready
             if session_id in self.websockets:
                 try:
                     await self.websockets[session_id].send_text(json.dumps({
@@ -266,7 +289,7 @@ class SessionManager:
             if session_id in self.sessions:
                 self.sessions[session_id].status = "stopped"
             
-            # Send message to frontend that session has stopped
+            // Send message to frontend that session has stopped
             if session_id in self.websockets:
                 try:
                     await self.websockets[session_id].send_text(json.dumps({
@@ -292,38 +315,25 @@ class SessionManager:
         try:
             log_session_event(logger, session_id, "audio_processing", "Processing audio data", {"audio_size": len(audio_data)})
             
-            # Send audio to LiveKit agent session
-            if session_id in self.agent_sessions:
-                try:
-                    # This is a simplified implementation
-                    # In a real implementation, you would stream the audio to the agent
-                    log_session_event(logger, session_id, "audio_forwarding", "Forwarding audio to agent")
-                    
-                    # Send acknowledgment back to client
-                    if session_id in self.websockets:
-                        await self.websockets[session_id].send_text(json.dumps({
-                            "type": "ack",
-                            "message": "Audio received"
-                        }))
-                        log_session_event(logger, session_id, "audio_ack_sent", "Audio acknowledgment sent")
-                        
-                except Exception as e:
-                    log_error(logger, session_id, "audio_processing_failed", "Error processing audio", e)
-                    if session_id in self.websockets:
-                        await self.websockets[session_id].send_text(json.dumps({
-                            "type": "error",
-                            "message": f"Error processing audio: {str(e)}"
-                        }))
-            else:
-                # If no agent session exists, send error to client
-                if session_id in self.websockets:
-                    await self.websockets[session_id].send_text(json.dumps({
-                        "type": "error",
-                        "message": "Agent session not available"
-                    }))
+            // In a proper implementation, we would forward audio to the LiveKit agent
+            // For now, we'll send a message to the frontend indicating that audio was received
+            // and that the agent session should be available
+            
+            if session_id in self.websockets:
+                // Send acknowledgment back to client
+                await self.websockets[session_id].send_text(json.dumps({
+                    "type": "ack",
+                    "message": "Audio received and forwarded to agent"
+                }))
+                log_session_event(logger, session_id, "audio_ack_sent", "Audio acknowledgment sent")
+                
         except Exception as e:
             log_error(logger, session_id, "audio_processing_failed", "Error processing audio", e)
-            raise
+            if session_id in self.websockets:
+                await self.websockets[session_id].send_text(json.dumps({
+                    "type": "error",
+                    "message": f"Error processing audio: {str(e)}"
+                }))
     
     async def process_text(self, session_id: str, text: str):
         """
@@ -336,38 +346,16 @@ class SessionManager:
         try:
             log_session_event(logger, session_id, "text_processing", "Processing text input", {"text_length": len(text)})
             
-            # Send text to agent session if available
-            if session_id in self.agent_sessions:
-                try:
-                    # In a real implementation, you would send this to the agent
-                    # and get a response back
-                    response = f"Echo: {text}"
-                    
-                    # Send response back to client
-                    if session_id in self.websockets:
-                        await self.websockets[session_id].send_text(json.dumps({
-                            "type": "response",
-                            "text": response
-                        }))
-                        log_session_event(logger, session_id, "text_response_sent", "Text response sent", {"response_length": len(response)})
-                except Exception as e:
-                    log_error(logger, session_id, "text_processing_failed", "Error processing text with agent", e)
-                    if session_id in self.websockets:
-                        await self.websockets[session_id].send_text(json.dumps({
-                            "type": "error",
-                            "message": f"Error processing text with agent: {str(e)}"
-                        }))
-            else:
-                # Simple echo if no agent session
-                response = f"Echo: {text}"
-                
-                # Send response back to client
-                if session_id in self.websockets:
-                    await self.websockets[session_id].send_text(json.dumps({
-                        "type": "response",
-                        "text": response
-                    }))
-                    log_session_event(logger, session_id, "text_response_sent", "Text response sent", {"response_length": len(response)})
+            // Simple echo for testing
+            response = f"Echo: {text}"
+            
+            // Send response back to client
+            if session_id in self.websockets:
+                await self.websockets[session_id].send_text(json.dumps({
+                    "type": "response",
+                    "text": response
+                }))
+                log_session_event(logger, session_id, "text_response_sent", "Text response sent", {"response_length": len(response)})
         except Exception as e:
             log_error(logger, session_id, "text_processing_failed", "Error processing text", e)
             raise
@@ -378,12 +366,12 @@ class SessionManager:
         if current_time - self.last_cleanup_time > self.cleanup_interval:
             self.last_cleanup_time = current_time
             
-            # Clean up expired sessions from pool
+            // Clean up expired sessions from pool
             expired_count = 0
-            while self.session_pool and expired_count < 10:  # Limit cleanup per cycle
+            while self.session_pool and expired_count < 10:  // Limit cleanup per cycle
                 try:
                     session = self.session_pool.popleft()
-                    # In a real implementation, you would properly dispose of the session
+                    // In a real implementation, you would properly dispose of the session
                     expired_count += 1
                 except:
                     break

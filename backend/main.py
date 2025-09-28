@@ -16,6 +16,9 @@ from core.optimizer import get_optimizer
 from schemas.session import SessionCreate, SessionResponse
 from schemas.conversation import ConversationMessage
 
+// Import WebSocket handling utilities
+import base64
+
 # Load environment variables
 load_dotenv()
 
@@ -32,16 +35,19 @@ app = FastAPI(
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify exact origins
+    allow_origins=["*"],  // In production, specify exact origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize session manager
+// Store active room connections
+active_rooms: Dict[str, Dict] = {}
+
+// Initialize session manager
 session_manager = SessionManager()
 
-# Initialize optimizer
+// Initialize optimizer
 optimizer = get_optimizer()
 
 @app.get("/")
@@ -71,12 +77,12 @@ async def create_session(session_data: SessionCreate):
             agent_name=session_data.agent_name
         )
         
-        # Generate LiveKit token for the session
+        // Generate LiveKit token for the session
         try:
-            # Create a unique room name for this session
+            // Create a unique room name for this session
             room_name = f"travel-session-{session_id[:8]}"
             
-            # Create access token for the user
+            // Create access token for the user
             user_identity = f"user-{session_id}"
             user_token = api.AccessToken(
                 api_key=settings.LIVEKIT_API_KEY,
@@ -91,7 +97,7 @@ async def create_session(session_data: SessionCreate):
                 )
             ).to_jwt()
             
-            # Create access token for the agent
+            // Create access token for the agent
             agent_identity = f"agent-{session_id}"
             agent_token = api.AccessToken(
                 api_key=settings.LIVEKIT_API_KEY,
@@ -106,14 +112,21 @@ async def create_session(session_data: SessionCreate):
                 )
             ).to_jwt()
             
-            # Update session info with LiveKit details
+            // Update session info with LiveKit details
             session_info["livekit_room"] = room_name
             session_info["livekit_user_token"] = user_token
             session_info["livekit_agent_token"] = agent_token
             
+            // Store room info for WebSocket connection
+            active_rooms[session_id] = {
+                "room_name": room_name,
+                "user_identity": user_identity,
+                "agent_identity": agent_identity
+            }
+            
         except Exception as token_error:
             log_error(logger, session_id, "token_generation_failed", "Failed to generate LiveKit tokens", token_error)
-            # Continue without tokens - session can still be created
+            // Continue without tokens - session can still be created
         
         log_session_event(logger, session_id, "session_created", "Session created successfully")
         
@@ -161,6 +174,11 @@ async def end_session(session_id: str):
     try:
         log_session_event(logger, session_id, "session_ending", "Ending session")
         await session_manager.end_session(session_id)
+        
+        // Clean up active room info
+        if session_id in active_rooms:
+            del active_rooms[session_id]
+            
         log_session_event(logger, session_id, "session_ended", "Session ended successfully")
         return {"message": f"Session {session_id} ended successfully"}
     except Exception as e:
@@ -179,10 +197,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     try:
         log_session_event(logger, session_id, "websocket_connection", "WebSocket connection attempt")
         
-        # Accept the WebSocket connection
+        // Accept the WebSocket connection
         await websocket.accept()
         
-        # Check if session exists
+        // Check if session exists
         session = session_manager.get_session(session_id)
         if not session:
             log_error(logger, session_id, "session_not_found", "Session not found during WebSocket connection")
@@ -193,50 +211,78 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             await websocket.close()
             return
         
+        // Check if room info exists
+        if session_id not in active_rooms:
+            log_error(logger, session_id, "room_not_found", "Room info not found for session")
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": "Room configuration not found"
+            }))
+            await websocket.close()
+            return
+        
+        room_info = active_rooms[session_id]
+        room_name = room_info["room_name"]
+        
         log_session_event(logger, session_id, "websocket_connected", "WebSocket connection established")
         
-        # Register WebSocket connection with session manager
+        // Register WebSocket connection with session manager
         await session_manager.register_websocket(session_id, websocket)
         
-        # Start the session with the LiveKit agent
+        // Start the session with the LiveKit agent
         await session_manager.start_session(session_id)
         
-        # Send connection confirmation to frontend
+        // Send connection confirmation to frontend with room info
         await websocket.send_text(json.dumps({
             "type": "connection_established",
-            "message": "Connected to voice service"
+            "message": "Connected to voice service",
+            "room_name": room_name,
+            "room_info": room_info
         }))
         
-        # Listen for messages
+        // Listen for messages
         while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
-            
-            log_session_event(logger, session_id, "message_received", "Message received via WebSocket", {"message_type": message.get("type")})
-            
-            # Process different message types
-            if message["type"] == "audio":
-                # Handle audio data
-                await session_manager.process_audio(session_id, message["data"])
-            elif message["type"] == "text":
-                # Handle text input (for testing)
-                await session_manager.process_text(session_id, message["text"])
-            elif message["type"] == "control":
-                # Handle control messages
-                if message["action"] == "start":
-                    # Send listening started message to frontend
-                    await websocket.send_text(json.dumps({
-                        "type": "listening_started",
-                        "message": "Listening started"
-                    }))
-                    await session_manager.start_session(session_id)
-                elif message["action"] == "stop":
-                    # Send listening stopped message to frontend
-                    await websocket.send_text(json.dumps({
-                        "type": "listening_stopped",
-                        "message": "Listening stopped"
-                    }))
-                    await session_manager.stop_session(session_id)
+            // Receive either text or bytes
+            try:
+                // Try to receive as text first
+                data = await websocket.receive_text()
+                message = json.loads(data)
+                
+                log_session_event(logger, session_id, "message_received", "Message received via WebSocket", {"message_type": message.get("type")})
+                
+                // Process different message types
+                if message["type"] == "audio":
+                    // Handle audio data
+                    await session_manager.process_audio(session_id, message["data"])
+                elif message["type"] == "text":
+                    // Handle text input (for testing)
+                    await session_manager.process_text(session_id, message["text"])
+                elif message["type"] == "control":
+                    // Handle control messages
+                    if message["action"] == "start":
+                        // Send listening started message to frontend
+                        await websocket.send_text(json.dumps({
+                            "type": "listening_started",
+                            "message": "Listening started"
+                        }))
+                        await session_manager.start_session(session_id)
+                    elif message["action"] == "stop":
+                        // Send listening stopped message to frontend
+                        await websocket.send_text(json.dumps({
+                            "type": "listening_stopped",
+                            "message": "Listening stopped"
+                        }))
+                        await session_manager.stop_session(session_id)
+            except:
+                // If text fails, try to receive as bytes (audio data)
+                try:
+                    audio_data = await websocket.receive_bytes()
+                    log_session_event(logger, session_id, "audio_received", "Audio data received via WebSocket", {"audio_size": len(audio_data)})
+                    // Process audio data
+                    await session_manager.process_audio(session_id, audio_data)
+                except Exception as audio_error:
+                    log_error(logger, session_id, "audio_receive_failed", "Failed to receive audio data", audio_error)
+                    raise audio_error
                 
     except Exception as e:
         log_error(logger, session_id, "websocket_error", "WebSocket error occurred", e)
@@ -249,7 +295,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             pass
         await websocket.close()
     finally:
-        # Clean up session on disconnect
+        // Clean up session on disconnect
         await session_manager.unregister_websocket(session_id)
         log_session_event(logger, session_id, "websocket_disconnected", "WebSocket connection closed")
 
@@ -264,17 +310,17 @@ async def create_token():
     Create a LiveKit token for connecting to a room
     """
     try:
-        # Generate a unique identity for the participant
+        // Generate a unique identity for the participant
         identity = f"user-{uuid.uuid4()}"
         
-        # Create access token with appropriate grants
+        // Create access token with appropriate grants
         token = api.AccessToken(
             api_key=settings.LIVEKIT_API_KEY,
             api_secret=settings.LIVEKIT_API_SECRET
         ).with_identity(identity).with_name("Web User").with_grants(
             api.VideoGrants(
                 room_join=True,
-                room="travel-assistant-room",  # Default room name
+                room="travel-assistant-room",  // Default room name
                 can_publish=True,
                 can_subscribe=True,
                 can_publish_data=True

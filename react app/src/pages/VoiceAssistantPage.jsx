@@ -18,10 +18,30 @@ const VoiceAssistantPage = () => {
     toggleListening 
   } = useBackendVoiceAssistant()
 
+  const [voiceActivity, setVoiceActivity] = useState(0)
+
   useEffect(() => {
     // Auto-connect to voice service when component mounts
     console.log('VoiceAssistantPage mounted, attempting to connect to voice service');
     connectToVoiceService()
+  }, [])
+
+  useEffect(() => {
+    // Listen for voice activity events from the hook
+    const handleVoiceActivity = (event) => {
+      // Handle both simple number values and complex objects
+      if (typeof event.detail === 'object' && event.detail !== null) {
+        setVoiceActivity(event.detail)
+      } else {
+        setVoiceActivity(event.detail)
+      }
+    }
+
+    window.addEventListener('voiceActivity', handleVoiceActivity)
+    
+    return () => {
+      window.removeEventListener('voiceActivity', handleVoiceActivity)
+    }
   }, [])
 
   return (
@@ -60,6 +80,7 @@ const VoiceAssistantPage = () => {
               isListening={isListening}
               isSpeaking={isSpeaking}
               isConnected={isConnected}
+              voiceActivity={voiceActivity}
               onToggleListening={toggleListening}
               onSendMessage={(text) => {
                 // For text messages, we would need to send them to the backend

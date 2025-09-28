@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Microphone Test</title>
+</head>
+<body>
+    <h1>Microphone Access Test</h1>
+    <button id="startBtn">Start Recording</button>
+    <button id="stopBtn" disabled>Stop Recording</button>
+    <div id="status">Not started</div>
+    <div id="log"></div>
+
+    <script>
+        let mediaRecorder;
+        let audioStream;
+        
+        const log = (message) => {
+            const logDiv = document.getElementById('log');
+            logDiv.innerHTML += `<p>${new Date().toISOString()}: ${message}</p>`;
+            console.log(message);
+        };
+        
+        document.getElementById('startBtn').addEventListener('click', async () => {
+            try {
+                document.getElementById('status').textContent = 'Requesting microphone access...';
+                log('Requesting microphone access...');
+                
+                // Request microphone access
+                audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                log('Microphone access granted!');
+                
+                // Create media recorder
+                mediaRecorder = new MediaRecorder(audioStream, {
+                    mimeType: 'audio/webm;codecs=opus'
+                });
+                log('MediaRecorder created');
+                
+                // Set up data handling
+                mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) {
+                        log(`Audio data available: ${event.data.size} bytes`);
+                    }
+                };
+                
+                mediaRecorder.onstart = () => {
+                    log('MediaRecorder started');
+                    document.getElementById('status').textContent = 'Recording...';
+                    document.getElementById('startBtn').disabled = true;
+                    document.getElementById('stopBtn').disabled = false;
+                };
+                
+                mediaRecorder.onstop = () => {
+                    log('MediaRecorder stopped');
+                    document.getElementById('status').textContent = 'Stopped';
+                    document.getElementById('startBtn').disabled = false;
+                    document.getElementById('stopBtn').disabled = true;
+                };
+                
+                // Start recording
+                mediaRecorder.start(1000); // Send data every 1000ms
+                log('Started recording');
+                
+            } catch (err) {
+                log(`Error: ${err.message}`);
+                document.getElementById('status').textContent = `Error: ${err.message}`;
+            }
+        });
+        
+        document.getElementById('stopBtn').addEventListener('click', () => {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+                audioStream.getTracks().forEach(track => track.stop());
+                log('Stopped recording and released microphone');
+            }
+        });
+    </script>
+</body>
+</html>

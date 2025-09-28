@@ -18,4 +18,3 @@ Pillow
 numpy
 pinecone
 livekit-agents[anam]
-livekit-api
